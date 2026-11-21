@@ -30,9 +30,11 @@ each source's terms and your local law.
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import queue
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -48,6 +50,7 @@ import requests.adapters
 from concurrent.futures import ThreadPoolExecutor
 
 UA = "MagnetIndexer/0.1 (personal indexer; respects robots.txt)"
+MAX_BYTES = 8 * 1024 * 1024  # cap on any single response body
 MAGNET_RE = re.compile(r"magnet:\?[^\s\"'<>]+", re.I)
 
 
@@ -169,6 +172,25 @@ def torrent_file_to_record(data: bytes, source: str) -> Optional[Torrent]:
 # --------------------------------------------------------------------------
 # Polite HTTP client: robots.txt, per-host rate limit, retries
 # --------------------------------------------------------------------------
+def check_public(url: str) -> bool:
+    """True only if url is http(s) and its host resolves exclusively to public IPs (SSRF guard)."""
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global:  # private, loopback, link-local, CGNAT, reserved, ...
+            return False
+    return True
+
+
 class Fetcher:
     """Thread-safe polite HTTP client.
 
@@ -179,7 +201,10 @@ class Fetcher:
     `deadline` (time.monotonic value) makes every call fail fast once passed.
     """
 
-    def __init__(self, delay: float = 1.0, respect_robots: bool = True, pool: int = 16):
+    def __init__(self, delay: float = 1.0, respect_robots: bool = True, pool: int = 16,
+                 block_private: bool = False):
+        self.block_private = block_private    # True for untrusted, user-supplied URLs
+        self._dns: dict = {}
         self.s = requests.Session()
         self.s.headers["User-Agent"] = UA
         ad = requests.adapters.HTTPAdapter(pool_connections=pool, pool_maxsize=pool)
@@ -208,7 +233,7 @@ class Fetcher:
             if rp is None:
                 rp = urllib.robotparser.RobotFileParser()
                 try:
-                    r = self.s.get(base + "/robots.txt", timeout=10)
+                    r = self.s.get(base + "/robots.txt", timeout=10, allow_redirects=False)
                     rp.parse(r.text.splitlines() if r.ok else [])
                 except requests.RequestException:
                     rp.parse([])
@@ -224,9 +249,51 @@ class Fetcher:
         if start > now:
             time.sleep(start - now)
 
+    def _public(self, url: str) -> bool:
+        host = urllib.parse.urlparse(url).hostname or ""
+        with self._lock:
+            hit = self._dns.get(host)
+        if hit and time.monotonic() - hit[1] < 300:
+            return hit[0]
+        ok = check_public(url)
+        with self._lock:
+            self._dns[host] = (ok, time.monotonic())
+        return ok
+
+    def _follow(self, url: str, timeout: float, **kw) -> Optional[requests.Response]:
+        """GET with manual redirects so every hop is re-validated; body capped at MAX_BYTES."""
+        for hop in range(6):
+            if hop:
+                if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+                    return None
+                if self.block_private and not self._public(url):
+                    return None
+                if not self._allowed(url):
+                    return None
+            r = self.s.get(url, timeout=timeout, allow_redirects=False, stream=True, **kw)
+            loc = r.headers.get("Location")
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                r.close()
+                url = urllib.parse.urljoin(url, loc)
+                continue
+            data = b""
+            for chunk in r.iter_content(65536):
+                data += chunk
+                if len(data) > MAX_BYTES:
+                    break
+            r._content, r._content_consumed = data[:MAX_BYTES], True
+            r.close()
+            return r
+        return None
+
     def get(self, url: str, **kw) -> Optional[requests.Response]:
         rem = self._remaining()
         if rem is not None and rem <= 0:
+            return None
+        if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+            return None
+        if self.block_private and not self._public(url):
+            print(f"  [blocked non-public host] {url}", file=sys.stderr)
             return None
         if not self._allowed(url):
             print(f"  [robots.txt disallows] {url}", file=sys.stderr)
@@ -239,7 +306,9 @@ class Fetcher:
                 return None
             try:
                 timeout = 20 if rem is None else max(1.0, min(20.0, rem))
-                r = self.s.get(url, timeout=timeout, **kw)
+                r = self._follow(url, timeout, **kw)
+                if r is None:
+                    return None
                 if r.status_code == 429:
                     time.sleep(2 * (attempt + 1))
                     self._wait_slot(host)
@@ -391,14 +460,14 @@ ADAPTERS = {"rss": RSSAdapter, "torznab": TorznabAdapter,
 
 def search_sources(sources: list, query: Optional[str] = None, timeout: float = 20.0,
                    delay: float = 1.0, workers: int = 8,
-                   respect_robots: bool = True) -> Iterator[Torrent]:
+                   respect_robots: bool = True, block_private: bool = False) -> Iterator[Torrent]:
     """Run every source concurrently and yield Torrents as they arrive.
 
     query=None crawls instead of searching. Results from fast sources appear
     immediately; slow ones are cut off at `timeout` seconds (partial results kept).
     Consume this generator from ONE thread (it owns no DB state).
     """
-    fetcher = Fetcher(delay, respect_robots, pool=max(16, workers * 2))
+    fetcher = Fetcher(delay, respect_robots, pool=max(16, workers * 2), block_private=block_private)
     start = time.monotonic()
     if timeout:
         fetcher.deadline = start + timeout
