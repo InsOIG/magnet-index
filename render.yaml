@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: magnet-index
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # 1 process + threads: the free instance has 512 MB RAM and a shared 0.1 CPU
+    startCommand: gunicorn webapp:app --workers 1 --threads 4 --timeout 90 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: MAGNET_DB
+        value: /tmp/magnets.db        # free tier filesystem is ephemeral
+      - key: LIVE_DEFAULT
+        value: "1"
+      - key: LIVE_TIMEOUT
+        value: "15"
+      - key: SITE_PASSWORD            # set in the dashboard; leave empty for a public site
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      # - key: SOURCES_JSON           # optional: full sources config as JSON (e.g. Torznab + API key)
+      #   sync: false

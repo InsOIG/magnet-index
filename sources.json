@@ -1,0 +1,5 @@
+{
+  "sources": [
+    {"type": "archive", "name": "internet-archive", "max_items": 20, "workers": 6, "delay": 0.5}
+  ]
+}
